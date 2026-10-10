@@ -4,6 +4,8 @@ import json
 import sqlite3
 import threading
 import time
+import hmac
+import re
 from contextlib import closing
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote, urlencode
@@ -49,6 +51,45 @@ class DocumentService:
             raise WorkflowFailure('登录用户与服务操作人不一致。')
         self.headers = {'x-acs-dingtalk-access-token': token}
         self.operator = operator
+        self.sign_key = hmac.new(config['client_secret'].encode(), b'ai-doc-recovery-v1', hashlib.sha256).digest()
+
+    def list_nodes(self, folder):
+        self.validate_folder(folder)
+        nodes, cursor, seen = [], '', set()
+        for _ in range(100):
+            query = {'operatorId': self.operator, 'parentNodeId': folder, 'maxResults': 50}
+            if cursor:
+                query['nextToken'] = cursor
+            page = request_json('https://api.dingtalk.com/v2.0/wiki/nodes?' + urlencode(query),
+                '恢复目录扫描', headers=self.headers)
+            if not isinstance(page.get('nodes'), list):
+                raise WorkflowFailure('目录扫描结果异常，恢复停止。')
+            for node in page['nodes']:
+                if node.get('workspaceId') != WORKSPACE:
+                    raise WorkflowFailure('扫描结果知识库归属异常。')
+                node = dict(node, recovery_folder=folder)
+                nodes.append(node)
+            cursor = page.get('nextToken', '')
+            if not cursor:
+                return nodes
+            if cursor in seen:
+                raise WorkflowFailure('目录游标重复，恢复停止。')
+            seen.add(cursor)
+        raise WorkflowFailure('目录扫描超过 5000 条，未完整恢复。')
+
+    def seal(self, value):
+        return hmac.new(self.sign_key, canonical(value).encode(), hashlib.sha256).hexdigest()
+
+    def recovery_record(self, key, digest, receipt):
+        payload = {'version': 1, 'operation': key, 'digest': digest, 'receipt': receipt, 'workspace': WORKSPACE}
+        return canonical({'payload': payload, 'signature': self.seal(payload)})
+
+    def save_recovery_record(self, key, digest, receipt):
+        text = self.recovery_record(key, digest, receipt)
+        # Duplicate identical manifests are harmless; conflicting signatures are rejected.
+        title_text = now()[:19].replace('T', ' ').replace(':', '') + '｜服务恢复凭据｜' + key
+        remote = self.create(title_text, FOLDERS['change'])
+        self.ensure_content(remote, text)
 
     def validate_folder(self, folder):
         result = request_json('https://api.dingtalk.com/v2.0/wiki/nodes/' + quote(folder, safe='') +
@@ -109,6 +150,75 @@ class Journal:
         self.lock = threading.RLock()
         with closing(sqlite3.connect(path)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT, receipt TEXT, verified INTEGER DEFAULT 0)')
+            db.execute('CREATE TABLE IF NOT EXISTS recovery_seals (id TEXT PRIMARY KEY)')
+
+    def sync_and_restore(self, service):
+        """Migrate trusted local receipts, then rebuild from signed remote evidence."""
+        with self.lock, closing(sqlite3.connect(self.path)) as db, db:
+            rows = db.execute('SELECT id,digest,receipt FROM operations WHERE verified=1 AND receipt IS NOT NULL').fetchall()
+            for key, digest, raw in rows:
+                if db.execute('SELECT 1 FROM recovery_seals WHERE id=?', (key,)).fetchone():
+                    continue
+                receipt = json.loads(raw)
+                if hashlib.sha256(''.join(service.read(receipt)).encode()).hexdigest() != digest:
+                    raise WorkflowFailure('本地回执对应远程正文已变化，禁止生成恢复凭据。')
+                service.save_recovery_record(key, digest, receipt)
+                db.execute('INSERT OR IGNORE INTO recovery_seals VALUES (?)', (key,))
+                db.commit()
+
+            nodes = []
+            for folder in dict.fromkeys(FOLDERS.values()):
+                nodes.extend(service.list_nodes(folder))
+            discovered = {}
+            by_url = {n.get('url', '').split('?')[0]: n for n in nodes}
+            warnings = []
+            for node in nodes:
+                if '｜服务恢复凭据｜' not in node.get('name', ''):
+                    continue
+                try:
+                    record = json.loads(''.join(service.read({'docKey': node['nodeId']})))
+                    payload, signature = record['payload'], record['signature']
+                    if not isinstance(signature, str) or not hmac.compare_digest(signature, service.seal(payload)):
+                        raise ValueError('signature')
+                    key, digest, receipt = payload['operation'], payload['digest'], payload['receipt']
+                    if payload.get('version') != 1 or payload.get('workspace') != WORKSPACE or not re.fullmatch(r'PR-[a-f0-9]{32}:(proposal|approval|published|change)', key):
+                        raise ValueError('schema')
+                    target = by_url.get(receipt['url'].split('?')[0])
+                    if not target:
+                        warnings.append('恢复凭据对应文档已删除或移出管理目录：' + key)
+                        continue
+                    phase = key.split(':')[1]
+                    if phase in ('proposal', 'approval', 'change') and target['recovery_folder'] != FOLDERS[phase]:
+                        raise ValueError('folder')
+                    text = ''.join(service.read(receipt))
+                    if hashlib.sha256(text.encode()).hexdigest() != digest:
+                        raise ValueError('content')
+                    candidate = (digest, canonical(receipt))
+                    if key in discovered and discovered[key] != candidate:
+                        raise WorkflowFailure('同一操作存在冲突恢复凭据，恢复停止。')
+                    discovered[key] = candidate
+                except (KeyError, TypeError, ValueError, ConnectionFailure):
+                    warnings.append('存在无效或不完整恢复凭据：' + node.get('nodeId', '未知'))
+            # An orphan operation document blocks retries even without a signed manifest.
+            phases = {'待审核提案': 'proposal', '人工审核批准': 'approval', '版本变更': 'change',
+                      **{kind: 'published' for kind in ('正式文档新版本', '修正日志', '会议记录', '问答记录')}}
+            for node in nodes:
+                match = re.search(r'｜([^｜]+)｜(PR-[a-f0-9]{32})｜', node.get('name', ''))
+                if match and match[1] in phases:
+                    key = match[2] + ':' + phases[match[1]]
+                    known = discovered.get(key)
+                    if known and json.loads(known[1])['url'].split('?')[0] != node.get('url', '').split('?')[0]:
+                        raise WorkflowFailure('同一提案步骤存在多个文档，恢复停止，请人工核对。')
+                    if not known:
+                        db.execute('INSERT OR IGNORE INTO operations(id,digest) VALUES (?,?)', (key, 'RECOVERY_UNCERTAIN'))
+                        warnings.append('未完成签名恢复，已阻止自动重试：' + key)
+            for key, (digest, receipt) in discovered.items():
+                existing = db.execute('SELECT digest,receipt FROM operations WHERE id=?', (key,)).fetchone()
+                if existing and existing[0] not in (digest, 'RECOVERY_UNCERTAIN'):
+                    raise WorkflowFailure('恢复内容与本地记录冲突。')
+                db.execute('INSERT OR REPLACE INTO operations VALUES (?,?,?,1)', (key, digest, receipt))
+                db.execute('INSERT OR IGNORE INTO recovery_seals VALUES (?)', (key,))
+            return {'restored': len(discovered), 'warnings': warnings}
 
     def proposals(self):
         """Locate remote documents using receipts; never treat local data as content."""
@@ -171,6 +281,10 @@ class Journal:
             # Always read, even previously verified documents; never trust stale receipts.
             service.ensure_content(receipt, text)
             db.execute('UPDATE operations SET verified=1 WHERE id=?', (key,))
+            db.commit()
+            if hasattr(service, 'save_recovery_record') and not db.execute('SELECT 1 FROM recovery_seals WHERE id=?', (key,)).fetchone():
+                service.save_recovery_record(key, digest, receipt)
+                db.execute('INSERT OR IGNORE INTO recovery_seals VALUES (?)', (key,))
             return receipt
 
 

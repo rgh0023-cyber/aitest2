@@ -3,7 +3,7 @@ import unittest
 import time
 from unittest.mock import patch
 from pathlib import Path
-from document_workflow import Journal, WorkflowFailure, archive, publish, DocumentService
+from document_workflow import Journal, WorkflowFailure, archive, publish, DocumentService, FOLDERS, WORKSPACE
 from proposal import create_proposal
 
 
@@ -88,6 +88,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(entry['status'], '已发布')
         with self.assertRaises(WorkflowFailure):
             self.journal.load_proposal(self.service, entry)
+
+    def recovery_service(self):
+        service = self.service
+        service.sign_key = b'test-only-signing-key'
+        service.seal = lambda value: DocumentService.seal(service, value)
+        service.recovery_record = lambda *args: DocumentService.recovery_record(service, *args)
+        service.save_recovery_record = lambda *args: DocumentService.save_recovery_record(service, *args)
+        service.read = lambda receipt: [service.content[receipt['docKey']]]
+        service.list_nodes = lambda folder: [dict(nodeId=str(i+1), url='https://alidocs.dingtalk.com/i/nodes/'+str(i+1),
+            name=name, recovery_folder=folder, workspaceId=WORKSPACE) for i,(name,target) in enumerate(service.created) if target==folder]
+        return service
+
+    def test_empty_database_restores_signed_pending_and_published(self):
+        service = self.recovery_service()
+        receipt = archive(self.journal, service, self.proposal)
+        rebuilt = Journal(str(Path(self.temp.name) / 'rebuilt.sqlite3'))
+        report = rebuilt.sync_and_restore(service)
+        self.assertEqual(report['restored'], 1)
+        entry = rebuilt.proposals()[0]
+        self.assertEqual(rebuilt.load_proposal(service, entry), self.proposal)
+        publish(self.journal, service, self.proposal, self.identity, self.approval, receipt)
+        another = Journal(str(Path(self.temp.name) / 'another.sqlite3'))
+        count = len(service.created)
+        self.assertEqual(another.sync_and_restore(service)['restored'], 4)
+        self.assertEqual(another.proposals()[0]['status'], '已发布')
+        publish(another, service, self.proposal, self.identity, self.approval, receipt)
+        self.assertEqual(len(service.created), count)
+
+    def test_tampered_signature_blocks_orphan_retry(self):
+        service = self.recovery_service()
+        archive(self.journal, service, self.proposal)
+        service.content['2'] = service.content['2'].replace('"signature":"', '"signature":"bad')
+        rebuilt = Journal(str(Path(self.temp.name) / 'tampered.sqlite3'))
+        report = rebuilt.sync_and_restore(service)
+        self.assertTrue(report['warnings'])
+        self.assertEqual(rebuilt.proposals(), [])
+        with self.assertRaises(WorkflowFailure):
+            archive(rebuilt, service, self.proposal)
+
+    def test_legacy_local_receipts_are_migrated_before_rebuild(self):
+        archive(self.journal, self.service, self.proposal)
+        service = self.recovery_service()
+        self.journal.sync_and_restore(service)
+        rebuilt = Journal(str(Path(self.temp.name) / 'legacy-rebuild.sqlite3'))
+        self.assertEqual(rebuilt.sync_and_restore(service)['restored'], 1)
+        self.assertEqual(rebuilt.proposals()[0]['id'], self.proposal['id'])
 
 
 if __name__ == '__main__':

@@ -14,7 +14,7 @@ st.title("AI文档助手")
 st.caption("第四阶段：单人审批发布试运行。提案、审核、发布与变更记录分别落库。")
 
 @st.cache_resource
-def execution_journal(schema_version=2):
+def execution_journal(schema_version=3):
     # Version cache entries so hot deployments do not retain obsolete classes.
     return Journal()
 
@@ -170,9 +170,28 @@ if st.button('测试钉钉连接', type='primary'):
 
 st.divider()
 st.header('已保存提案')
-st.caption('最近 100 条已有执行回执的提案。加载时从钉钉回读全文；本服务云端重建导致回执丢失的旧提案暂不能自动找回。')
+st.caption('登录后自动从钉钉扫描并校验恢复凭据，展示最近 100 条提案。恢复只重建列表与执行状态，不自动批准或发布。')
 list_identity = st.session_state.get('reviewer_identity')
 if list_identity and list_identity.get('expires_at', 0) > time.time():
+    if not st.session_state.get('cloud_recovery_v1'):
+        try:
+            with st.spinner('从钉钉校验并恢复提案和执行状态…'):
+                recovery_service = DocumentService(config, list_identity)
+                report = execution_journal().sync_and_restore(recovery_service)
+            st.session_state['cloud_recovery_v1'] = report
+        except (WorkflowFailure, ConnectionFailure) as error:
+            st.error(str(error) if isinstance(error, WorkflowFailure) else '恢复失败：' + error.stage + '；' + str(error.code))
+            st.info('恢复未完整完成，暂不开放写入。请核对后重试。')
+            st.stop()
+        except Exception:
+            st.error('恢复异常，写入暂时关闭。')
+            st.stop()
+    report = st.session_state['cloud_recovery_v1']
+    st.caption('已校验恢复 ' + str(report['restored']) + ' 个执行步骤。')
+    if report['warnings']:
+        with st.expander('恢复中需要核对的记录'):
+            for warning in report['warnings']:
+                st.text(warning)
     entries = execution_journal().proposals()
     if entries:
         labels = {entry['id']: entry['status'] + '｜' + entry['id'] for entry in entries}
@@ -195,7 +214,9 @@ if list_identity and list_identity.get('expires_at', 0) > time.time():
                 st.error('读取异常，提案未加载。')
     else:
         st.info('当前服务暂无可定位的已保存提案。')
-    st.button('刷新提案列表')
+    if st.button('重新扫描钉钉并刷新列表'):
+        st.session_state.pop('cloud_recovery_v1', None)
+        st.rerun()
 else:
     st.info('完成钉钉登录后，可查看和加载已保存的提案。')
 
@@ -300,4 +321,4 @@ if snapshot and verify(snapshot):
             st.link_button('查看' + label, receipts[kind]['url'])
         st.download_button('下载执行回执（请留存）', json.dumps(receipts, ensure_ascii=False, indent=2),
             file_name=snapshot['id'] + '-receipts.json', mime='application/json')
-    st.caption('当前执行回执保存在服务本地 SQLite，云端重建可能丢失；正式记录已在钉钉，但尚无跨重启恢复队列。此阶段只用于单人试运行，请保留下载回执。')
+    st.caption('执行回执及签名恢复凭据已分别保存到钉钉；本地 SQLite 可从完整凭据重建。无签名、正文变化或不完整步骤将停止自动恢复执行，请人工核对。当前仍为单人试运行。')
