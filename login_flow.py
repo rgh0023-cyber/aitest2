@@ -13,6 +13,25 @@ class LoginFailure(Exception):
     pass
 
 
+def parse_callback(states, auth_codes, codes, errors):
+    """Accept identical code aliases, but reject repeated keys and conflicts."""
+    counts = f'state={len(states)}, authCode={len(auth_codes)}, code={len(codes)}, error={len(errors)}'
+    if len(states) != 1 or not states[0] or len(states[0]) > 100:
+        raise LoginFailure('回调 state 缺失、重复或无效（' + counts + '），请重新登录。')
+    if any(len(values) > 1 for values in (auth_codes, codes, errors)):
+        raise LoginFailure('回调参数存在重复键（' + counts + '），请重新登录。')
+    if errors:
+        if auth_codes or codes:
+            raise LoginFailure('回调同时包含错误与授权码，已拒绝。')
+        return states[0], None, True
+    candidates = auth_codes + codes
+    if not candidates or any(not c or len(c) > 4096 for c in candidates):
+        raise LoginFailure('回调授权码缺失或无效（' + counts + '），请重新登录。')
+    if len(candidates) == 2 and not hmac.compare_digest(candidates[0].encode(), candidates[1].encode()):
+        raise LoginFailure('回调 code 与 authCode 不一致，已拒绝。')
+    return states[0], candidates[0], False
+
+
 class LoginRegistry:
     def __init__(self, clock=time.monotonic, ttl=300):
         self.clock, self.ttl = clock, ttl

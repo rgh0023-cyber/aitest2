@@ -1,11 +1,22 @@
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlparse, parse_qs
-from login_flow import LoginRegistry, LoginFailure, authorization_url, verify_login, REDIRECT_URI
+from login_flow import LoginRegistry, LoginFailure, authorization_url, verify_login, REDIRECT_URI, parse_callback
 from dingtalk_client import ConnectionFailure
 
 
 class LoginTests(unittest.TestCase):
+    def test_callback_aliases_and_repeated_keys(self):
+        for auth_codes, codes in [(['same'], []), ([], ['same']), (['same'], ['same'])]:
+            self.assertEqual(parse_callback(['state'], auth_codes, codes, []), ('state', 'same', False))
+        for states, auth_codes, codes, errors in [([], ['c'], [], []),
+            (['s', 's'], ['c'], [], []), (['s'], ['c', 'c'], [], []),
+            (['s'], ['c'], ['different'], []), (['s'], [], [], []),
+            (['s'], ['c'], [], ['denied'])]:
+            with self.assertRaises(LoginFailure):
+                parse_callback(states, auth_codes, codes, errors)
+        self.assertEqual(parse_callback(['s'], [], [], ['denied']), ('s', None, True))
+
     def test_single_use_and_origin_session_isolation(self):
         registry = LoginRegistry()
         state, owner = registry.begin()

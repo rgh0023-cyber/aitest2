@@ -6,7 +6,7 @@ import streamlit as st
 from dingtalk_client import ConnectionFailure, test_connection
 from proposal import create_proposal, export_markdown, verify
 import json
-from login_flow import LoginRegistry, LoginFailure, authorization_url, verify_login
+from login_flow import LoginRegistry, LoginFailure, authorization_url, verify_login, parse_callback
 
 st.set_page_config(page_title="AI文档助手", page_icon="📄")
 st.title("AI文档助手")
@@ -21,23 +21,20 @@ registry = login_registry()
 # result using a separate owner secret, which is never included in any URL.
 if any(k in st.query_params for k in ('authCode', 'code', 'error')):
     states = st.query_params.get_all('state')
-    codes = st.query_params.get_all('authCode') + st.query_params.get_all('code')
-    denied = 'error' in st.query_params
+    auth_codes = st.query_params.get_all('authCode')
+    codes = st.query_params.get_all('code')
+    errors = st.query_params.get_all('error')
     st.query_params.clear()
     claimed = False
     try:
-        if len(states) != 1 or (not denied and len(codes) != 1):
-            raise LoginFailure('回调参数不完整或重复，请重新登录。')
-        state = states[0]
-        if len(state) > 100 or (codes and len(codes[0]) > 4096):
-            raise LoginFailure('回调参数无效。')
+        state, code, denied = parse_callback(states, auth_codes, codes, errors)
         registry.claim(state)
         claimed = True
         if denied:
             registry.complete(state, {'error': '用户未完成授权，请重新发起登录。'})
             st.info('授权未完成。请返回发起登录的原页面。')
         else:
-            identity = verify_login(dict(st.secrets['dingtalk']), codes[0])
+            identity = verify_login(dict(st.secrets['dingtalk']), code)
             registry.complete(state, {'identity': identity})
             st.success('身份验证完成。请返回发起登录的原页面，此标签页可以关闭。')
     except ConnectionFailure as error:
