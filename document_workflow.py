@@ -110,6 +110,48 @@ class Journal:
         with closing(sqlite3.connect(path)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT, receipt TEXT, verified INTEGER DEFAULT 0)')
 
+    def proposals(self):
+        """Locate remote documents using receipts; never treat local data as content."""
+        with self.lock, closing(sqlite3.connect(self.path)) as db:
+            rows = db.execute("SELECT id,receipt,verified FROM operations WHERE id LIKE '%:proposal' ORDER BY rowid DESC LIMIT 100").fetchall()
+            result = []
+            for key, raw, verified in rows:
+                if not raw or not verified:
+                    continue
+                proposal_id = key.removesuffix(':proposal')
+                phases = dict(db.execute('SELECT id,verified FROM operations WHERE id IN (?,?,?)',
+                    tuple(proposal_id + ':' + phase for phase in ('approval', 'published', 'change'))).fetchall())
+                status = '待审核'
+                if proposal_id + ':approval' in phases:
+                    status = '审批执行中（需核对）'
+                if phases.get(proposal_id + ':change'):
+                    status = '已发布'
+                result.append({'id': proposal_id, 'receipt': json.loads(raw), 'status': status})
+            return result
+
+    def load_proposal(self, service, entry):
+        if entry['status'] != '待审核':
+            raise WorkflowFailure('该提案已进入审批或发布，不可作为新的待审提案批准。')
+        text = ''.join(service.read(entry['receipt']))
+        marker = '\n\n机器快照（待审核）：\n'
+        if marker not in text:
+            raise WorkflowFailure('远程提案不包含可校验快照，请人工核对。')
+        try:
+            proposal = json.loads(text.rsplit(marker, 1)[1])
+        except (ValueError, TypeError):
+            raise WorkflowFailure('远程提案快照格式异常。') from None
+        check_proposal(proposal)
+        if proposal['id'] != entry['id']:
+            raise WorkflowFailure('远程提案编号与回执不一致。')
+        expected = export_markdown(proposal) + marker + canonical(proposal)
+        if text != expected:
+            raise WorkflowFailure('远程正文与快照不一致，禁止加载审批。')
+        with self.lock, closing(sqlite3.connect(self.path)) as db:
+            row = db.execute('SELECT digest FROM operations WHERE id=?', (entry['id'] + ':proposal',)).fetchone()
+        if not row or row[0] != hashlib.sha256(text.encode()).hexdigest():
+            raise WorkflowFailure('远程提案内容与初次落库指纹不同，禁止加载审批。')
+        return proposal
+
     def document(self, service, key, title, folder, text):
         digest = hashlib.sha256(text.encode()).hexdigest()
         with self.lock, closing(sqlite3.connect(self.path)) as db, db:

@@ -168,6 +168,37 @@ if st.button('测试钉钉连接', type='primary'):
             st.error('配置或运行异常。请检查配置；页面不会显示敏感诊断详情。')
 
 st.divider()
+st.header('已保存提案')
+st.caption('最近 100 条已有执行回执的提案。加载时从钉钉回读全文；本服务云端重建导致回执丢失的旧提案暂不能自动找回。')
+list_identity = st.session_state.get('reviewer_identity')
+if list_identity and list_identity.get('expires_at', 0) > time.time():
+    entries = execution_journal().proposals()
+    if entries:
+        labels = {entry['id']: entry['status'] + '｜' + entry['id'] for entry in entries}
+        selected = st.selectbox('选择已保存提案', [entry['id'] for entry in entries], format_func=lambda value: labels[value])
+        selected_entry = next(entry for entry in entries if entry['id'] == selected)
+        st.link_button('在钉钉查看所选提案', selected_entry['receipt']['url'])
+        if st.button('从钉钉加载待审核提案', disabled=selected_entry['status'] != '待审核'):
+            try:
+                with st.spinner('回读正文并校验初次落库指纹…'):
+                    service = DocumentService(config, list_identity)
+                    loaded = execution_journal().load_proposal(service, selected_entry)
+                st.session_state['proposal_snapshot'] = loaded
+                st.session_state['proposal_receipt'] = selected_entry['receipt']
+                for key in ('approval_record', 'publication_receipts', 'review_notes'):
+                    st.session_state.pop(key, None)
+                st.success('已从钉钉加载，向下查看待审核提案及审批入口。')
+            except (WorkflowFailure, ConnectionFailure) as error:
+                st.error(str(error) if isinstance(error, WorkflowFailure) else '读取失败：' + error.stage + '；' + str(error.code))
+            except Exception:
+                st.error('读取异常，提案未加载。')
+    else:
+        st.info('当前服务暂无可定位的已保存提案。')
+    st.button('刷新提案列表')
+else:
+    st.info('完成钉钉登录后，可查看和加载已保存的提案。')
+
+st.divider()
 st.header('创建提案')
 st.caption('将 Agent 生成的内容粘贴或上传到这里。每次生成独立快照，修改后需重新生成。当前快照仅在本次会话中保存，请及时下载；刷新、退出或服务重启可能丢失。')
 uploaded = st.file_uploader('导入 Agent 生成的 Markdown 正文（最多 1 MB）', type=['md', 'txt'])

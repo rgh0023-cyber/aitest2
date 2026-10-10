@@ -70,6 +70,25 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         self.assertEqual(request.call_args.args[2]['element']['paragraph']['text'], text[1800:])
 
+    def test_new_session_loads_exact_remote_proposal(self):
+        archive(self.journal, self.service, self.proposal)
+        reopened = Journal(self.journal.path)
+        entries = reopened.proposals()
+        self.assertEqual(entries[0]['status'], '待审核')
+        self.service.read = lambda receipt: [self.service.content[receipt['docKey']]]
+        self.assertEqual(reopened.load_proposal(self.service, entries[0]), self.proposal)
+        self.service.content[entries[0]['receipt']['docKey']] += '篡改'
+        with self.assertRaises(WorkflowFailure):
+            reopened.load_proposal(self.service, entries[0])
+
+    def test_published_proposal_cannot_load_as_pending(self):
+        receipt = archive(self.journal, self.service, self.proposal)
+        publish(self.journal, self.service, self.proposal, self.identity, self.approval, receipt)
+        entry = self.journal.proposals()[0]
+        self.assertEqual(entry['status'], '已发布')
+        with self.assertRaises(WorkflowFailure):
+            self.journal.load_proposal(self.service, entry)
+
 
 if __name__ == '__main__':
     unittest.main()
