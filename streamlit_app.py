@@ -4,10 +4,12 @@ import time
 import streamlit as st
 
 from dingtalk_client import ConnectionFailure, test_connection
+from proposal import create_proposal, export_markdown, verify
+import json
 
 st.set_page_config(page_title="AI文档助手", page_icon="📄")
 st.title("AI文档助手")
-st.caption("第一阶段：应用连接诊断。提案、审批和文档写入功能尚未开放。")
+st.caption("第二阶段：提案准备与内容核对。正式审批及知识库写入等待钉钉身份接入。")
 
 # A public URL must not expose application-powered document queries.
 try:
@@ -64,3 +66,52 @@ if st.button('测试钉钉连接', type='primary'):
             st.caption('密钥、访问凭证和原始错误响应已隐藏。')
         except Exception:
             st.error('配置或运行异常。请检查配置；页面不会显示敏感诊断详情。')
+
+st.divider()
+st.header('创建提案')
+st.caption('将 Agent 生成的内容粘贴或上传到这里。每次生成独立快照，修改后需重新生成。当前快照仅在本次会话中保存，请及时下载；刷新、退出或服务重启可能丢失。')
+uploaded = st.file_uploader('导入 Agent 生成的 Markdown 正文（最多 1 MB）', type=['md', 'txt'])
+imported = ''
+if uploaded:
+    try:
+        if uploaded.size > 1024 * 1024:
+            st.error('文件超过 1 MB，请拆分后导入。')
+        else:
+            imported = uploaded.getvalue().decode('utf-8-sig')
+    except UnicodeDecodeError:
+        st.error('文件必须使用 UTF-8 编码。')
+with st.form('proposal_form'):
+    project = st.text_input('项目', value='level tunning', max_chars=200)
+    module = st.text_input('功能模块或沟通主题', max_chars=200)
+    kind = st.selectbox('记录类型', ['正式文档新版本', '修正日志', '会议记录', '问答记录'])
+    title = st.text_input('文档标题', max_chars=200)
+    reason = st.text_area('变更原因、依据及关联的旧版本', max_chars=2000)
+    content = st.text_area('Agent 提案正文', value=imported, height=300, max_chars=6000)
+    submitted = st.form_submit_button('生成待审核快照')
+if submitted:
+    try:
+        snapshot = create_proposal(project, module, title, kind, reason, content)
+        st.session_state['proposal_snapshot'] = snapshot
+        st.session_state.pop('review_notes', None)
+        st.success('已生成待审核快照。')
+    except ValueError as error:
+        st.error(str(error))
+snapshot = st.session_state.get('proposal_snapshot')
+if snapshot and verify(snapshot):
+    st.header('待审核提案')
+    st.write('编号：' + snapshot['id'])
+    st.write('时间：' + snapshot['created_at'] + '（北京时间）')
+    st.code(snapshot['sha256'], language=None)
+    st.write('类型：' + snapshot['kind'] + '；范围：' + snapshot['action'])
+    st.text(snapshot['title'])
+    st.text(snapshot['reason'])
+    # Render untrusted document text literally: no remote image requests or HTML.
+    st.text(snapshot['content'])
+    notes = st.text_area('核对意见（不构成审批）', key='review_notes', max_chars=3000)
+    st.download_button('下载提案 Markdown', export_markdown(snapshot),
+        file_name=snapshot['id'] + '.md', mime='text/markdown')
+    record = {'proposal': snapshot, 'review_notes': notes, 'approval': None, 'execution': None}
+    st.download_button('下载提案与核对意见 JSON', json.dumps(record, ensure_ascii=False, indent=2),
+        file_name=snapshot['id'] + '.json', mime='application/json')
+    st.warning('尚未接入钉钉审核身份与持久化队列。核对意见不会产生批准状态，也不会触发知识库写入。')
+    st.button('批准并写入知识库（等待身份接入）', disabled=True)
