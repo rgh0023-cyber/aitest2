@@ -7,10 +7,15 @@ from dingtalk_client import ConnectionFailure, test_connection
 from proposal import create_proposal, export_markdown, verify
 import json
 from login_flow import LoginRegistry, LoginFailure, authorization_url, verify_login, parse_callback
+from document_workflow import Journal, DocumentService, WorkflowFailure, archive, publish, now
 
 st.set_page_config(page_title="AI文档助手", page_icon="📄")
 st.title("AI文档助手")
-st.caption("第三阶段：钉钉登录身份验证与提案准备。正式审批及知识库写入尚未开放。")
+st.caption("第四阶段：单人审批发布试运行。提案、审核、发布与变更记录分别落库。")
+
+@st.cache_resource
+def execution_journal():
+    return Journal()
 
 @st.cache_resource
 def login_registry():
@@ -188,6 +193,8 @@ if submitted:
         snapshot = create_proposal(project, module, title, kind, reason, content)
         st.session_state['proposal_snapshot'] = snapshot
         st.session_state.pop('review_notes', None)
+        for key in ('proposal_receipt', 'approval_record', 'publication_receipts'):
+            st.session_state.pop(key, None)
         st.success('已生成待审核快照。')
     except ValueError as error:
         st.error(str(error))
@@ -208,5 +215,57 @@ if snapshot and verify(snapshot):
     record = {'proposal': snapshot, 'review_notes': notes, 'approval': None, 'execution': None}
     st.download_button('下载提案与核对意见 JSON', json.dumps(record, ensure_ascii=False, indent=2),
         file_name=snapshot['id'] + '.json', mime='application/json')
-    st.warning('知识库持久化及正式审批尚未开放。核对意见不会产生批准状态，也不会触发知识库写入。')
-    st.button('批准并写入知识库（等待持久化接入）', disabled=True)
+    st.divider()
+    st.caption('限 level tunning 单人试运行。先保存待审核提案，再批准创建独立版本；不覆盖旧文档。项目索引尚未自动更新。')
+    active_identity = st.session_state.get('reviewer_identity')
+    logged_in = bool(active_identity and active_identity.get('expires_at', 0) > time.time())
+    if not logged_in:
+        st.info('请先完成钉钉审核人登录，才能保存提案或批准发布。')
+    if st.button('保存待审核提案到钉钉', disabled=not logged_in):
+        try:
+            with st.spinner('保存独立提案并回读验证…'):
+                service = DocumentService(config, active_identity)
+                st.session_state['proposal_receipt'] = archive(execution_journal(), service, snapshot)
+            st.success('待审核提案已落库并通过回读。')
+        except (WorkflowFailure, ConnectionFailure) as error:
+            st.error(str(error) if isinstance(error, WorkflowFailure) else '落库失败：' + error.stage + '；' + str(error.code))
+        except Exception:
+            st.error('执行异常。请先核对知识库，不要重新生成同一提案来绕过操作记录。')
+    receipt = st.session_state.get('proposal_receipt')
+    if receipt:
+        st.link_button('查看钉钉待审核提案', receipt['url'])
+        st.warning('批准后将创建新文档，并分别保存人工批准和版本变更记录。请核对上方全部正文及修改范围。')
+        with st.form('approve_form'):
+            confirmed = st.checkbox('我已核对本提案全文，批准此内容创建独立文档')
+            decision_notes = st.text_area('审核说明（可选）', max_chars=2000)
+            approve_clicked = st.form_submit_button('批准并发布当前提案', disabled=not logged_in or bool(st.session_state.get('publication_receipts')))
+        if approve_clicked:
+            if not confirmed:
+                st.error('请先明确勾选全文审核确认。')
+            else:
+                try:
+                    # Only a logged-in human button action creates this record.
+                    approval = st.session_state.get('approval_record')
+                    if not approval:
+                        approval = {'proposal_id': snapshot['id'], 'proposal_hash': snapshot['sha256'],
+                            'reviewer': active_identity['union_id'], 'reviewer_name': active_identity['name'],
+                            'approved_at': now(), 'notes': decision_notes, 'decision': '批准创建独立文档'}
+                        st.session_state['approval_record'] = approval
+                    with st.spinner('保存审核记录、发布正文并逐项回读…'):
+                        service = DocumentService(config, active_identity)
+                        st.session_state['publication_receipts'] = publish(execution_journal(), service,
+                            snapshot, active_identity, approval, receipt)
+                    st.success('发布及独立变更记录已回读通过；项目索引仍待更新。')
+                except (WorkflowFailure, ConnectionFailure) as error:
+                    st.error(str(error) if isinstance(error, WorkflowFailure) else '发布中断：' + error.stage + '；' + str(error.code))
+                    st.warning('可能已完成部分步骤。保留当前提案；同一提案再次执行会先核对已有回执，创建结果不确定时会停止。')
+                except Exception:
+                    st.error('执行异常，可能存在部分落库。请核对知识库，不要改用新提案编号重复发布。')
+    receipts = st.session_state.get('publication_receipts')
+    if receipts:
+        for kind, label in [('proposal', '提案记录'), ('approval', '人工批准记录'),
+                            ('published', '发布文档'), ('change', '版本变更记录')]:
+            st.link_button('查看' + label, receipts[kind]['url'])
+        st.download_button('下载执行回执（请留存）', json.dumps(receipts, ensure_ascii=False, indent=2),
+            file_name=snapshot['id'] + '-receipts.json', mime='application/json')
+    st.caption('当前执行回执保存在服务本地 SQLite，云端重建可能丢失；正式记录已在钉钉，但尚无跨重启恢复队列。此阶段只用于单人试运行，请保留下载回执。')
