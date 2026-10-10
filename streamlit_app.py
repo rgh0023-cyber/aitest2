@@ -6,10 +6,60 @@ import streamlit as st
 from dingtalk_client import ConnectionFailure, test_connection
 from proposal import create_proposal, export_markdown, verify
 import json
+from login_flow import LoginRegistry, LoginFailure, authorization_url, verify_login
 
 st.set_page_config(page_title="AI文档助手", page_icon="📄")
 st.title("AI文档助手")
-st.caption("第二阶段：提案准备与内容核对。正式审批及知识库写入等待钉钉身份接入。")
+st.caption("第三阶段：钉钉登录身份验证与提案准备。正式审批及知识库写入尚未开放。")
+
+@st.cache_resource
+def login_registry():
+    return LoginRegistry()
+
+registry = login_registry()
+# OAuth redirects open a fresh tab/session. Only the original tab can poll the
+# result using a separate owner secret, which is never included in any URL.
+if any(k in st.query_params for k in ('authCode', 'code', 'error')):
+    states = st.query_params.get_all('state')
+    codes = st.query_params.get_all('authCode') + st.query_params.get_all('code')
+    denied = 'error' in st.query_params
+    st.query_params.clear()
+    claimed = False
+    try:
+        if len(states) != 1 or (not denied and len(codes) != 1):
+            raise LoginFailure('回调参数不完整或重复，请重新登录。')
+        state = states[0]
+        if len(state) > 100 or (codes and len(codes[0]) > 4096):
+            raise LoginFailure('回调参数无效。')
+        registry.claim(state)
+        claimed = True
+        if denied:
+            registry.complete(state, {'error': '用户未完成授权，请重新发起登录。'})
+            st.info('授权未完成。请返回发起登录的原页面。')
+        else:
+            identity = verify_login(dict(st.secrets['dingtalk']), codes[0])
+            registry.complete(state, {'identity': identity})
+            st.success('身份验证完成。请返回发起登录的原页面，此标签页可以关闭。')
+    except ConnectionFailure as error:
+        message = '登录失败：' + error.stage + '；错误码：' + str(error.code)
+        if claimed:
+            try:
+                registry.complete(state, {'error': message})
+            except LoginFailure:
+                pass
+        st.error(message)
+        if error.scopes:
+            st.warning('需要权限：' + '、'.join(error.scopes))
+    except LoginFailure as error:
+        st.error(str(error))
+    except Exception:
+        if claimed:
+            try:
+                registry.complete(state, {'error': '登录处理失败，请重新发起。'})
+            except LoginFailure:
+                pass
+        st.error('登录处理失败，请返回原页面重新发起。')
+    st.stop()
 
 # A public URL must not expose application-powered document queries.
 try:
@@ -34,6 +84,9 @@ if not st.session_state.get('diagnostic_authorized'):
     st.caption('仅用于单人试运行，不代表钉钉身份认证。')
     st.stop()
 if st.button('退出诊断'):
+    pending = st.session_state.get('login_pending')
+    if pending:
+        registry.cancel(*pending)
     st.session_state.clear()
     st.rerun()
 
@@ -47,6 +100,51 @@ missing = [key for key in ('client_id', 'client_secret', 'workspace_id')
 if missing:
     st.error('缺少配置项：' + '、'.join(missing))
     st.stop()
+
+st.header('钉钉审核人登录')
+identity = st.session_state.get('reviewer_identity')
+if identity and identity['expires_at'] <= time.time():
+    st.session_state.pop('reviewer_identity', None)
+    identity = None
+if identity:
+    st.success('已验证审核人：' + identity['name'])
+    st.caption('身份有效期 30 分钟，仅当前会话有效。登录成功不等于批准任何提案。')
+    if st.button('退出钉钉审核身份'):
+        st.session_state.pop('reviewer_identity', None)
+        st.rerun()
+else:
+    st.caption('点击后在新标签页授权；请保留当前页面。仅允许服务配置的操作人登录。')
+    if st.button('准备钉钉登录'):
+        previous = st.session_state.pop('login_pending', None)
+        if previous:
+            registry.cancel(*previous)
+        try:
+            st.session_state['login_pending'] = registry.begin()
+        except LoginFailure as error:
+            st.error(str(error))
+
+    @st.fragment(run_every='3s')
+    def login_status():
+        pending = st.session_state.get('login_pending')
+        if not pending:
+            return
+        try:
+            result = registry.poll(*pending)
+        except LoginFailure as error:
+            st.session_state.pop('login_pending', None)
+            st.warning(str(error))
+            return
+        if result:
+            st.session_state.pop('login_pending', None)
+            if 'identity' in result:
+                st.session_state['reviewer_identity'] = result['identity']
+                st.rerun()
+            else:
+                st.error(result['error'])
+        else:
+            st.link_button('打开钉钉授权页面', authorization_url(config['client_id'], pending[0]))
+            st.caption('等待授权结果，5 分钟后过期。完成后回到本页面自动显示身份。')
+    login_status()
 
 st.info('点击后使用企业应用凭据认证，以配置的操作人读取目标知识库；不会创建、修改或删除文档。')
 if st.button('测试钉钉连接', type='primary'):
@@ -113,5 +211,5 @@ if snapshot and verify(snapshot):
     record = {'proposal': snapshot, 'review_notes': notes, 'approval': None, 'execution': None}
     st.download_button('下载提案与核对意见 JSON', json.dumps(record, ensure_ascii=False, indent=2),
         file_name=snapshot['id'] + '.json', mime='application/json')
-    st.warning('尚未接入钉钉审核身份与持久化队列。核对意见不会产生批准状态，也不会触发知识库写入。')
-    st.button('批准并写入知识库（等待身份接入）', disabled=True)
+    st.warning('知识库持久化及正式审批尚未开放。核对意见不会产生批准状态，也不会触发知识库写入。')
+    st.button('批准并写入知识库（等待持久化接入）', disabled=True)
