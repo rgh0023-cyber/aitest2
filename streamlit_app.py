@@ -14,7 +14,8 @@ st.title("AI文档助手")
 st.caption("第四阶段：单人审批发布试运行。提案、审核、发布与变更记录分别落库。")
 
 @st.cache_resource
-def execution_journal():
+def execution_journal(schema_version=2):
+    # Version cache entries so hot deployments do not retain obsolete classes.
     return Journal()
 
 @st.cache_resource
