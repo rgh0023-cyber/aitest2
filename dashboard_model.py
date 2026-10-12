@@ -2,7 +2,7 @@
 from datetime import datetime, timezone, timedelta
 import time
 
-STATUSES = ['待审核', '审批执行中（需核对）', '已发布']
+STATUSES = ['待审核', '审批执行中（需核对）', '已发布', '已拒绝']
 
 
 def project_members(records, clock=None):

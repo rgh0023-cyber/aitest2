@@ -33,6 +33,7 @@ for review_kind in ('proposal', 'approval', '修正日志', '会议记录', '问
 RECOVERY_FOLDER = REVIEW_FOLDER
 FOLDERS['backup'] = BACKUP_FOLDER
 FOLDERS['backup_manifest'] = BACKUP_FOLDER
+FOLDERS['rejection'] = REVIEW_FOLDER
 
 
 def folder_workspace(folder):
@@ -171,6 +172,7 @@ class Journal:
             db.execute('CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT, receipt TEXT, verified INTEGER DEFAULT 0)')
             db.execute('CREATE TABLE IF NOT EXISTS recovery_seals (id TEXT PRIMARY KEY)')
             db.execute('CREATE TABLE IF NOT EXISTS proposal_catalog (id TEXT PRIMARY KEY, metadata TEXT)')
+            db.execute('CREATE TABLE IF NOT EXISTS decision_claims (id TEXT PRIMARY KEY, decision TEXT, digest TEXT)')
 
     def sync_and_restore(self, service):
         """Migrate trusted local receipts, then rebuild from signed remote evidence."""
@@ -201,14 +203,14 @@ class Journal:
                     if not isinstance(signature, str) or not hmac.compare_digest(signature, service.seal(payload)):
                         raise ValueError('signature')
                     key, digest, receipt = payload['operation'], payload['digest'], payload['receipt']
-                    if payload.get('version') != 1 or payload.get('workspace') != WORKSPACE or not re.fullmatch(r'PR-[a-f0-9]{32}:(proposal|approval|published|change|backup|backup_manifest)', key):
+                    if payload.get('version') != 1 or payload.get('workspace') != WORKSPACE or not re.fullmatch(r'PR-[a-f0-9]{32}:(proposal|approval|rejection|published|change|backup|backup_manifest)', key):
                         raise ValueError('schema')
                     target = by_url.get(receipt['url'].split('?')[0])
                     if not target:
                         warnings.append('恢复凭据对应文档已删除或移出管理目录：' + key)
                         continue
                     phase = key.split(':')[1]
-                    if phase in ('proposal', 'approval', 'change', 'backup', 'backup_manifest') and target['recovery_folder'] not in (FOLDERS[phase], LEGACY_FOLDERS.get(phase)):
+                    if phase in ('proposal', 'approval', 'rejection', 'change', 'backup', 'backup_manifest') and target['recovery_folder'] not in (FOLDERS[phase], LEGACY_FOLDERS.get(phase)):
                         raise ValueError('folder')
                     text = ''.join(service.read(receipt))
                     if hashlib.sha256(text.encode()).hexdigest() != digest:
@@ -228,7 +230,7 @@ class Journal:
                 except (KeyError, TypeError, ValueError, ConnectionFailure):
                     warnings.append('存在无效或不完整恢复凭据：' + node.get('nodeId', '未知'))
             # An orphan operation document blocks retries even without a signed manifest.
-            phases = {'待审核提案': 'proposal', '人工审核批准': 'approval', '版本变更': 'change', '版本备份':'backup', '备份清单':'backup_manifest',
+            phases = {'待审核提案': 'proposal', '人工审核批准': 'approval', '人工审核拒绝':'rejection', '版本变更': 'change', '版本备份':'backup', '备份清单':'backup_manifest',
                       **{kind: 'published' for kind in ('正式文档新版本', '修正日志', '会议记录', '问答记录')}}
             for node in nodes:
                 match = re.search(r'｜([^｜]+)｜(PR-[a-f0-9]{32})｜', node.get('name', ''))
@@ -248,26 +250,51 @@ class Journal:
                 db.execute('INSERT OR IGNORE INTO recovery_seals VALUES (?)', (key,))
             return {'restored': len(discovered), 'warnings': warnings}
 
-    def proposals(self):
+    def proposals(self, proposal_id=None):
         """Locate remote documents using receipts; never treat local data as content."""
         with self.lock, closing(sqlite3.connect(self.path)) as db:
-            rows = db.execute("SELECT id,receipt,verified FROM operations WHERE id LIKE '%:proposal' ORDER BY rowid DESC LIMIT 100").fetchall()
+            rows = (db.execute('SELECT id,receipt,verified FROM operations WHERE id=?', (proposal_id+':proposal',)).fetchall()
+                    if proposal_id else db.execute("SELECT id,receipt,verified FROM operations WHERE id LIKE '%:proposal' ORDER BY rowid DESC LIMIT 100").fetchall())
             result = []
             for key, raw, verified in rows:
                 if not raw or not verified:
                     continue
                 proposal_id = key.removesuffix(':proposal')
-                phases = dict(db.execute('SELECT id,verified FROM operations WHERE id IN (?,?,?)',
-                    tuple(proposal_id + ':' + phase for phase in ('approval', 'published', 'change'))).fetchall())
+                phases = dict(db.execute('SELECT id,verified FROM operations WHERE id IN (?,?,?,?)',
+                    tuple(proposal_id + ':' + phase for phase in ('approval', 'published', 'change','rejection'))).fetchall())
                 status = '待审核'
                 if proposal_id + ':approval' in phases:
                     status = '审批执行中（需核对）'
                 if phases.get(proposal_id + ':change'):
                     status = '已发布'
+                if proposal_id + ':rejection' in phases:
+                    status = '已拒绝' if phases[proposal_id + ':rejection'] else '审批执行中（需核对）'
+                if status == '待审核' and db.execute('SELECT 1 FROM decision_claims WHERE id=?',(proposal_id,)).fetchone():
+                    status = '审批执行中（需核对）'
                 metadata = db.execute('SELECT metadata FROM proposal_catalog WHERE id=?', (proposal_id,)).fetchone()
                 result.append({**(json.loads(metadata[0]) if metadata else {}),
                                'id': proposal_id, 'receipt': json.loads(raw), 'status': status})
             return result
+
+    def verified_step(self, service, proposal_id, phase):
+        with self.lock, closing(sqlite3.connect(self.path)) as db:
+            row = db.execute('SELECT digest,receipt,verified FROM operations WHERE id=?',(proposal_id+':'+phase,)).fetchone()
+        if not row or not row[1] or not row[2]:
+            raise WorkflowFailure('审核步骤未确认完成。')
+        receipt=json.loads(row[1])
+        if hashlib.sha256(''.join(service.read(receipt)).encode()).hexdigest()!=row[0]:
+            raise WorkflowFailure('审核步骤正文与已验证记录不一致。')
+        return receipt
+
+    def claim_decision(self, proposal, decision):
+        with self.lock, closing(sqlite3.connect(self.path)) as db, db:
+            opposite = ('approval','published','change') if decision == 'rejected' else ('rejection',)
+            if any(db.execute('SELECT 1 FROM operations WHERE id=?', (proposal['id']+':'+phase,)).fetchone() for phase in opposite):
+                raise WorkflowFailure('该提案已有相反审核决定或执行记录，不能再次审核。')
+            db.execute('INSERT OR IGNORE INTO decision_claims VALUES (?,?,?)', (proposal['id'],decision,proposal['sha256']))
+            row = db.execute('SELECT decision,digest FROM decision_claims WHERE id=?',(proposal['id'],)).fetchone()
+            if row != (decision,proposal['sha256']):
+                raise WorkflowFailure('该提案已绑定其他审核决定，请先核对执行记录。')
 
     def load_proposal(self, service, entry, readonly=False):
         if entry['status'] != '待审核' and not readonly:
@@ -362,6 +389,7 @@ def publish(journal, service, proposal, identity, approval, proposal_receipt):
     archived = archive(journal, service, proposal)
     if archived != proposal_receipt:
         raise WorkflowFailure('提案落库回执不匹配。')
+    journal.claim_decision(proposal, 'approved')
     review_text = '人工批准记录\n' + canonical(approval) + '\n提案：' + archived['url']
     review = journal.document(service, proposal['id'] + ':approval', title(proposal, '人工审核批准'), FOLDERS['approval'], review_text)
     text = '\n'.join([proposal['title'], '状态：已批准发布', '模块或主题：' + proposal['module'],
@@ -374,3 +402,17 @@ def publish(journal, service, proposal, identity, approval, proposal_receipt):
         'verification': '正文逐块精确回读通过', 'index_status': '尚未更新项目索引'})
     change = journal.document(service, proposal['id'] + ':change', title(proposal, '版本变更'), FOLDERS['change'], change_text)
     return {'proposal': archived, 'approval': review, 'published': document, 'change': change}
+
+
+def reject(journal, service, proposal, identity, decision, proposal_receipt):
+    check_proposal(proposal)
+    if identity.get('expires_at',0) <= time.time() or identity.get('union_id') != service.operator:
+        raise WorkflowFailure('审核身份已失效或不匹配。')
+    if decision.get('proposal_hash') != proposal['sha256'] or decision.get('reviewer') != identity['union_id']:
+        raise WorkflowFailure('拒绝决定未绑定当前提案与登录身份。')
+    archived = archive(journal,service,proposal)
+    if archived != proposal_receipt:
+        raise WorkflowFailure('提案落库回执不匹配。')
+    journal.claim_decision(proposal,'rejected')
+    text = '人工拒绝记录\n'+canonical(decision)+'\n提案：'+archived['url']
+    return journal.document(service,proposal['id']+':rejection',title(proposal,'人工审核拒绝'),FOLDERS['rejection'],text)

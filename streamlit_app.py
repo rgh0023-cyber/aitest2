@@ -8,7 +8,7 @@ from document_workflow import Journal
 
 st.set_page_config(page_title="AI文档助手", page_icon="📄")
 @st.cache_resource
-def execution_journal(schema_version=6):
+def execution_journal(schema_version=7):
     # Version cache entries so hot deployments do not retain obsolete classes.
     return Journal()
 
@@ -66,7 +66,7 @@ if missing:
     st.error('缺少配置项：' + '、'.join(missing))
     st.stop()
 
-if st.query_params.get('page') == 'submit':
+if st.query_params.get('page') in ('submit', 'status'):
     from agent_page import render
     render(config)
     st.stop()

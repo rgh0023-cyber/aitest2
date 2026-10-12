@@ -40,4 +40,4 @@ def submit(journal,service,payload,principal):
     receipt=archive(journal,service,proposal)
     return {'proposal_id':proposal['id'],'proposal_sha256':proposal['sha256'],
         'request_id':payload['request_id'],'submitted_by':principal['subject_id'],
-        'status':'待审核','review_library_url':receipt['url']}
+        'status':journal.proposals(proposal['id'])[0]['status'],'review_library_url':receipt['url']}

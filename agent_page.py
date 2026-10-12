@@ -20,6 +20,21 @@ def render(config):
     identity = login(config, 'submitter')
     if not identity:
         st.stop()
+    if st.session_state.get('agent_current_subject') != identity['union_id']:
+        for key in ('agent_submission_receipt','submission_status_result','agent_request_id','status_proposal_id'):
+            st.session_state.pop(key,None)
+        st.session_state['agent_current_subject']=identity['union_id']
+    if st.query_params.get('page') == 'status':
+        render_status(config,identity)
+        return
+    submit_tab,status_tab=st.tabs(['提交提案','查询审核状态'])
+    with submit_tab:
+        render_submit(config,identity)
+    with status_tab:
+        render_status(config,identity)
+
+
+def render_submit(config,identity):
     if identity and st.button('申请 level tunning 提交权限'):
         try:
             request_access(configured_service(config), identity)
@@ -89,3 +104,39 @@ def render(config):
         st.download_button('下载提交回执',json.dumps(result,ensure_ascii=False,indent=2),
             file_name=result['request_id']+'-receipt.json',mime='application/json')
 
+
+
+def render_status(config,identity):
+    from submission_status import lookup
+    st.subheader('查询审核状态')
+    st.caption('仅查询当前钉钉身份提交的提案。审核通过不一定是正式业务文档，结果会说明保存性质。')
+    last=st.session_state.get('agent_submission_receipt',{}).get('proposal_id','')
+    with st.form('submission_status_form'):
+        proposal_id=st.text_input('提案编号',value=last,key='status_proposal_id')
+        queried=st.form_submit_button('查询审核状态')
+    if queried:
+        st.session_state.pop('submission_status_result',None)
+        try:
+            with st.spinner('核验提案归属与审核记录…'):
+                service=configured_service(config)
+                journal=Journal()
+                journal.sync_and_restore(service)
+                st.session_state['submission_status_result']=lookup(journal,service,identity,proposal_id.strip())
+        except WorkflowFailure as error:
+            st.error(str(error))
+        except ConnectionFailure as error:
+            st.error('查询未完成：'+error.stage+'；'+str(error.code))
+        except Exception:
+            st.error('状态未确认，请保持编号，稍后核对。')
+    result=st.session_state.get('submission_status_result')
+    if result:
+        st.write('审核状态：'+result['status'])
+        st.write('内容性质：'+result['library_state'])
+        st.link_button('查看原提案',result['review_library_url'])
+        if result['decision_url']:
+            st.link_button('查看审核决定',result['decision_url'])
+        if result['formal_document_url']:
+            st.link_button('查看已发布正式版本',result['formal_document_url'])
+        elif result['record_url']:
+            st.link_button('查看过程记录',result['record_url'])
+        st.json(result)
