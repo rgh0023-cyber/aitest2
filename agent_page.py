@@ -14,8 +14,9 @@ from dingtalk_client import ConnectionFailure
 from submission_service import submit
 
 def render(config):
-    st.title('Agent 提案提交')
-    st.caption('独立提交入口，只能向 level tunning 提交待审核提案。提交不代表批准或正式发布。')
+    status_page=st.query_params.get('page')=='status'
+    st.title('Agent 审核状态查询' if status_page else 'Agent 提案提交')
+    st.caption('查询本人提案的审核状态与发布链接。' if status_page else '仅向 level tunning 提交待审核提案；提交不代表批准或正式发布。')
     st.link_button('读取 ai文档核心skill','https://alidocs.dingtalk.com/i/nodes/dpYLaezmVNLda0ZjiKAY3ml38rMqPxX6')
     identity = login(config, 'submitter')
     if not identity:
