@@ -12,6 +12,8 @@ def lookup(journal, service, identity, proposal_id):
     if not entries:
         raise WorkflowFailure('未找到属于你的提案，请核对编号与钉钉登录身份。')
     entry=entries[0]
+    if entry.get('submitted_by')!='DING-'+identity['union_id']:
+        raise WorkflowFailure('未找到属于你的提案，请核对编号与钉钉登录身份。')
     proposal=journal.load_proposal(service,entry,readonly=True)
     if proposal.get('submitted_by')!='DING-'+identity['union_id']:
         raise WorkflowFailure('未找到属于你的提案，请核对编号与钉钉登录身份。')
