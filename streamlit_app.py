@@ -12,23 +12,12 @@ from backup_service import run_backup
 from agent_access import grant, revoke, credentials
 
 st.set_page_config(page_title="AI文档助手", page_icon="📄")
-if st.query_params.get('page') == 'submit':
-    from agent_page import render
-    render()
-    st.stop()  # Submission credentials can never reach owner/reviewer controls.
-st.title("AI文档助手")
-st.caption("第四阶段：单人审批发布试运行。提案、审核、发布与变更记录分别落库。")
-st.caption('level tunning：审核库保存过程，正式库保存批准版本，备份库保存最新完整副本与历史 diff。')
-
 @st.cache_resource
 def execution_journal(schema_version=5):
     # Version cache entries so hot deployments do not retain obsolete classes.
     return Journal()
 
-@st.cache_resource
-def login_registry():
-    return LoginRegistry()
-
+from login_ui import login_registry, login
 registry = login_registry()
 # OAuth redirects open a fresh tab/session. Only the original tab can poll the
 # result using a separate owner secret, which is never included in any URL.
@@ -41,13 +30,13 @@ if any(k in st.query_params for k in ('authCode', 'code', 'error')):
     claimed = False
     try:
         state, code, denied = parse_callback(states, auth_codes, codes, errors)
-        registry.claim(state)
+        purpose = registry.claim(state)
         claimed = True
         if denied:
             registry.complete(state, {'error': '用户未完成授权，请重新发起登录。'})
             st.info('授权未完成。请返回发起登录的原页面。')
         else:
-            identity = verify_login(dict(st.secrets['dingtalk']), code)
+            identity = verify_login(dict(st.secrets['dingtalk']), code, purpose)
             registry.complete(state, {'identity': identity})
             st.success('身份验证完成。请返回发起登录的原页面，此标签页可以关闭。')
     except ConnectionFailure as error:
@@ -71,35 +60,6 @@ if any(k in st.query_params for k in ('authCode', 'code', 'error')):
         st.error('登录处理失败，请返回原页面重新发起。')
     st.stop()
 
-# A public URL must not expose application-powered document queries.
-try:
-    access_password = st.secrets['access']['diagnostic_password']
-except (KeyError, FileNotFoundError):
-    st.warning('请先在 Secrets 中添加 [access] diagnostic_password，配置完成前诊断功能关闭。')
-    st.stop()
-if not isinstance(access_password, str) or len(access_password) < 16:
-    st.warning('诊断访问密码至少需要 16 个字符。')
-    st.stop()
-
-def authenticate():
-    value = st.session_state.get('diagnostic_login', '')
-    st.session_state['diagnostic_authorized'] = hmac.compare_digest(
-        value.encode('utf-8'), access_password.encode('utf-8'))
-    st.session_state.pop('diagnostic_login', None)
-
-if not st.session_state.get('diagnostic_authorized'):
-    st.text_input('诊断访问密码', type='password', key='diagnostic_login', on_change=authenticate)
-    if st.session_state.get('diagnostic_authorized') is False:
-        st.error('密码不正确。')
-    st.caption('仅用于单人试运行，不代表钉钉身份认证。')
-    st.stop()
-if st.button('退出诊断'):
-    pending = st.session_state.get('login_pending')
-    if pending:
-        registry.cancel(*pending)
-    st.session_state.clear()
-    st.rerun()
-
 try:
     config = dict(st.secrets['dingtalk'])
 except (KeyError, FileNotFoundError):
@@ -111,93 +71,42 @@ if missing:
     st.error('缺少配置项：' + '、'.join(missing))
     st.stop()
 
-st.header('钉钉审核人登录')
-identity = st.session_state.get('reviewer_identity')
-if identity and identity['expires_at'] <= time.time():
-    st.session_state.pop('reviewer_identity', None)
-    identity = None
-if identity:
-    st.success('已验证审核人：' + identity['name'])
-    st.caption('身份有效期 30 分钟，仅当前会话有效。登录成功不等于批准任何提案。')
-    if st.button('退出钉钉审核身份'):
-        st.session_state.pop('reviewer_identity', None)
-        st.rerun()
-else:
-    st.caption('点击后在新标签页授权；请保留当前页面。仅允许服务配置的操作人登录。')
-    if st.button('准备钉钉登录'):
-        previous = st.session_state.pop('login_pending', None)
-        if previous:
-            registry.cancel(*previous)
-        try:
-            st.session_state['login_pending'] = registry.begin()
-        except LoginFailure as error:
-            st.error(str(error))
+if st.query_params.get('page') == 'submit':
+    from agent_page import render
+    render(config)
+    st.stop()
 
-    @st.fragment(run_every='3s')
-    def login_status():
-        pending = st.session_state.get('login_pending')
-        if not pending:
-            return
-        try:
-            result = registry.poll(*pending)
-        except LoginFailure as error:
-            st.session_state.pop('login_pending', None)
-            st.warning(str(error))
-            return
-        if result:
-            st.session_state.pop('login_pending', None)
-            if 'identity' in result:
-                st.session_state['reviewer_identity'] = result['identity']
-                st.rerun()
-            else:
-                st.error(result['error'])
-        else:
-            st.link_button('打开钉钉授权页面', authorization_url(config['client_id'], pending[0]))
-            st.caption('等待授权结果，5 分钟后过期。完成后回到本页面自动显示身份。')
-    login_status()
+st.title('AI文档助手')
+st.caption('提交、审核、正式发布分别授权；登录不代表批准。')
+identity = login(config, 'reviewer')
+if not identity:
+    st.stop()
 
-if st.session_state.get('reviewer_identity',{}).get('expires_at',0)>time.time():
-    with st.expander('管理其他 Agent 的提交权限'):
-        st.caption('每个凭据仅允许向 level tunning 提交待审材料。身份指凭据对应标识，不代替参与者本人的钉钉登录验证。凭据原文只显示给你，钉钉只存哈希与签名；妥善私下交给对应参与者。')
-        st.link_button('其他 Agent 的提交页面','https://aitest-kltimq4ak9guq9eijbhz3j.streamlit.app/?page=submit')
-        with st.form('issue_agent_credential'):
-            label=st.text_input('参与者或 Agent 标识',max_chars=80)
-            days=st.number_input('有效天数',min_value=1,max_value=30,value=7)
-            issue=st.form_submit_button('创建仅提交凭据')
-        if issue:
+from project_access import records as access_records, write as access_write
+with st.expander('管理项目参与者'):
+    st.link_button('参与者提交入口', 'https://aitest-kltimq4ak9guq9eijbhz3j.streamlit.app/?page=submit')
+    if st.button('读取钉钉接入申请与权限'):
+        try:
+            st.session_state['project_access_records'] = access_records(DocumentService(config, identity))
+        except (WorkflowFailure, ConnectionFailure):
+            st.error('接入记录核验失败。')
+    items = st.session_state.get('project_access_records', [])
+    subjects = {}
+    for item in sorted(items, key=lambda v: (v['created_at'], v['id'])):
+        subjects[item['union_id']] = item
+    if subjects:
+        st.table([{'参与者': v['name'], '状态': v['action'], '到期': time.strftime('%Y-%m-%d', time.localtime(v['expires_at']))} for v in subjects.values()])
+        chosen = st.selectbox('参与者', list(subjects), format_func=lambda k: subjects[k]['name'] + ' · ' + k[-6:])
+        days = st.number_input('提交授权有效天数', min_value=1, max_value=365, value=30)
+        allow = st.button('批准该参与者向 level tunning 提交')
+        deny = st.button('撤销该参与者的提交权限')
+        if allow or deny:
             try:
-                access_service=DocumentService(config,st.session_state['reviewer_identity'])
-                token,payload,receipt=grant(access_service,label,int(days))
-                st.session_state['new_agent_grant']={'token':token,'label':payload['label'],'id':payload['credential_id']}
-                st.success('已创建并回读验证，仅具备提案提交权限。')
-            except (WorkflowFailure,ConnectionFailure):
-                st.error('创建未确认成功，请检查审核库接入记录，勿重复创建。')
-        new_grant=st.session_state.get('new_agent_grant')
-        if new_grant:
-            st.write('凭据对应：'+new_grant['label'])
-            st.code(new_grant['token'],language=None)
-            if st.button('我已保存，隐藏凭据'):
-                st.session_state.pop('new_agent_grant',None)
-                st.rerun()
-        if st.button('读取提交凭据列表'):
-            try:
-                st.session_state['agent_grants']=credentials(DocumentService(config,st.session_state['reviewer_identity']))
-            except (WorkflowFailure,ConnectionFailure):
-                st.error('无法核验接入记录。')
-        grants=st.session_state.get('agent_grants',[])
-        if grants:
-            active=[item for item in grants if not item['revoked'] and item['expires_at']>time.time()]
-            st.table([{'标识':item['label'],'权限':'仅提交','状态':'已撤销' if item['revoked'] else '有效' if item['expires_at']>time.time() else '已过期'} for item in grants])
-            if active:
-                chosen=st.selectbox('要撤销的提交凭据',[item['credential_id'] for item in active],
-                    format_func=lambda key:next(item['label'] for item in active if item['credential_id']==key))
-                if st.button('撤销所选提交凭据'):
-                    try:
-                        revoke(DocumentService(config,st.session_state['reviewer_identity']),chosen)
-                        st.session_state.pop('agent_grants',None)
-                        st.success('已撤销并回读验证；之后的提交会拒绝此凭据。')
-                    except (WorkflowFailure,ConnectionFailure):
-                        st.error('撤销未确认成功，请检查接入记录。')
+                access_write(DocumentService(config, identity), subjects[chosen], 'grant' if allow else 'revoke', int(days))
+                st.session_state.pop('project_access_records', None)
+                st.success('权限变更已落库并回读验证。')
+            except (WorkflowFailure, ConnectionFailure):
+                st.error('权限变更未确认成功，请核对接入记录后再操作。')
 
 st.info('点击后使用企业应用凭据认证，以配置的操作人读取目标知识库；不会创建、修改或删除文档。')
 if st.button('测试钉钉连接', type='primary'):
@@ -310,7 +219,10 @@ if snapshot and verify(snapshot):
     st.code(snapshot['sha256'], language=None)
     st.write('类型：' + snapshot['kind'] + '；范围：' + snapshot['action'])
     if snapshot.get('submitted_by'):
-        st.write('提交身份（独立 Agent 凭据）：'+snapshot['submitted_by'])
+        st.write('提交身份：'+snapshot['submitted_by'])
+        if snapshot.get('target_url'):
+            st.link_button('查看本次目标正式文档', snapshot['target_url'])
+            st.text('基线 SHA-256：' + snapshot['baseline_sha256'])
         st.write('请求 ID：'+snapshot.get('submission_request_id',''))
         st.write('文档 ID：'+str(snapshot.get('document_id') or '待登记')+'；基线修订：'+str(snapshot.get('base_revision_id') or '待核验'))
     st.text(snapshot['title'])

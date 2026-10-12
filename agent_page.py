@@ -5,7 +5,9 @@ import hashlib
 from contextlib import closing
 import sqlite3
 import streamlit as st
-from agent_access import authenticate
+from project_access import authorize, request_access
+from login_ui import login
+from target_document import resolve
 from daily_backup import configured_service
 from document_workflow import Journal, WorkflowFailure, archive, FOLDERS
 from submission_contract import validate, SubmissionFailure, PROJECT_ID
@@ -15,13 +17,20 @@ from proposal import canonical
 
 from submission_service import submit
 
-def render():
+def render(config):
     st.title('Agent 提案提交')
     st.caption('独立提交入口，只能向 level tunning 提交待审核提案。提交不代表批准或正式发布。')
     st.link_button('读取 ai文档核心skill','https://alidocs.dingtalk.com/i/nodes/dpYLaezmVNLda0ZjiKAY3ml38rMqPxX6')
-    st.info('使用管理员分配给你的独立提交凭据；不要使用审核人诊断密码或钉钉应用密钥。')
-    token=st.text_input('Agent 提交凭据',type='password',key='agent_submission_token')
-    st.caption('凭据不会放入 URL、提案正文或下载回执。不要在截图中显示它。')
+    identity = login(config, 'submitter')
+    if not identity:
+        st.stop()
+    if identity and st.button('申请 level tunning 提交权限'):
+        try:
+            request_access(configured_service(config), identity)
+            st.success('接入申请已记录；管理员批准一次后即可提交，无须领取密码。')
+        except (WorkflowFailure, ConnectionFailure):
+            st.error('接入申请未确认，请管理员核对记录。')
+    st.caption('新参与者需一次项目接入批准。登录只识别提交人，不授予审核权限。')
     uploaded=st.file_uploader('可选：上传提案 JSON',type=['json'])
     imported={}
     if uploaded:
@@ -37,6 +46,7 @@ def render():
         st.session_state['agent_request_id']=str(uuid.uuid4())
     with st.form('agent_submission_form'):
         request_id=st.text_input('请求 ID（重试保留，内容变化须换新 ID）',value=imported.get('request_id',st.session_state['agent_request_id']))
+        target_url=st.text_input('目标正式文档链接',value=imported.get('target_url',''),key='agent_target_url')
         module=st.text_input('模块或主题',value=imported.get('module',''),max_chars=200)
         title=st.text_input('提案标题',value=imported.get('title',''),max_chars=200)
         kinds=['正式文档新版本','修正日志','会议记录','问答记录']
@@ -53,10 +63,13 @@ def render():
                 config=dict(st.secrets['dingtalk'])
                 with st.spinner('验证提交权限、核对重复请求并保存提案…'):
                     service=configured_service(config)
-                    principal=authenticate(service,token)
+                    principal=authorize(service,identity)
+                    baseline=resolve(service,target_url)
                     payload=dict(imported) if imported else {}
                     payload.update(schema_version=1,request_id=request_id,project_id=PROJECT_ID,
-                        module=module,title=title,kind=kind,reason=reason,content=content)
+                        module=module,title=title,kind=kind,reason=reason,content=content,
+                        target_url=baseline['url'],document_id=baseline['document_id'],
+                        baseline_sha256=baseline['content_sha256'])
                     validate(payload,principal)  # Always validate, including retries.
                     journal=Journal()
                     journal.sync_and_restore(service)

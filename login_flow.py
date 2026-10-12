@@ -42,14 +42,16 @@ class LoginRegistry:
         now = self.clock()
         self.items = {k: v for k, v in self.items.items() if v['expires'] > now}
 
-    def begin(self):
+    def begin(self, purpose='reviewer'):
+        if purpose not in ('reviewer', 'submitter'):
+            raise LoginFailure('登录用途无效。')
         with self.lock:
             self._prune()
             if len(self.items) >= 100:
                 raise LoginFailure('登录请求过多，请稍后再试。')
             state, owner = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
             self.items[state] = {'owner': owner, 'expires': self.clock() + self.ttl,
-                                 'status': 'pending', 'result': None}
+                                 'status': 'pending', 'result': None, 'purpose': purpose}
             return state, owner
 
     def claim(self, state):
@@ -59,6 +61,7 @@ class LoginRegistry:
             if not item or item['status'] != 'pending':
                 raise LoginFailure('登录请求无效、已使用或已过期，请返回原页面重新发起。')
             item['status'] = 'processing'
+            return item['purpose']
 
     def complete(self, state, result):
         with self.lock:
@@ -93,7 +96,7 @@ def authorization_url(client_id, state):
         'response_type': 'code', 'prompt': 'consent', 'scope': 'openid'})
 
 
-def verify_login(config, code):
+def verify_login(config, code, purpose='reviewer'):
     """Read identity using user token, authorize by verified configured operator identity."""
     auth = request_json('https://api.dingtalk.com/v1.0/oauth2/userAccessToken', '登录授权码交换',
         {'clientId': config['client_id'], 'clientSecret': config['client_secret'],
@@ -106,6 +109,11 @@ def verify_login(config, code):
     union_id = user.get('unionId')
     if not isinstance(union_id, str) or not union_id:
         raise ConnectionFailure('登录用户身份', 'MISSING_UNION_ID')
+    if purpose == 'submitter':
+        return {'union_id': union_id, 'name': user.get('nick') or '已认证参与者',
+                'authenticated_at': time.time(), 'expires_at': time.time() + 1800}
+    if purpose != 'reviewer':
+        raise LoginFailure('登录用途无效。')
     app = request_json('https://api.dingtalk.com/v1.0/oauth2/accessToken', '审核人校验',
         {'appKey': config['client_id'], 'appSecret': config['client_secret']})
     app_token = app.get('accessToken')

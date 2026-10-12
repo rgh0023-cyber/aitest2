@@ -2,11 +2,12 @@
 import hashlib
 import json
 import uuid
+import re
 from proposal import canonical, create_proposal, fingerprint
 
 PROJECT_ID = 'PRJ-4a5cce5e-e785-57e2-833a-010a6f9394d2'
 FIELDS = {'schema_version', 'request_id', 'project_id', 'module', 'title', 'kind', 'reason', 'content',
-          'document_id', 'base_revision_id', 'code_bindings'}
+          'document_id', 'base_revision_id', 'code_bindings', 'target_url', 'baseline_sha256'}
 
 
 class SubmissionFailure(ValueError):
@@ -34,6 +35,11 @@ def validate(payload, principal):
     if principal.get('scope') != 'proposal:submit' or not principal.get('subject_id'):
         raise SubmissionFailure('提交身份或权限无效。')
     uuid_id(payload.get('request_id'), '')
+    if payload.get('target_url') is not None:
+        if not isinstance(payload['target_url'], str) or not re.fullmatch(r'https://alidocs\.dingtalk\.com/i/nodes/[A-Za-z0-9]+', payload['target_url']):
+            raise SubmissionFailure('目标文档链接无效。')
+        if not isinstance(payload.get('baseline_sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', payload['baseline_sha256']):
+            raise SubmissionFailure('目标文档基线指纹缺失。')
     for key, prefix in [('document_id','DOC-'), ('base_revision_id','REV-')]:
         if payload.get(key) is not None:
             uuid_id(payload[key], prefix)
@@ -56,6 +62,7 @@ def validate(payload, principal):
     # Principal is supplied only by server authentication; never accept caller's claimed identity.
     proposal.update(submitted_by=principal['subject_id'], submission_request_id=payload['request_id'],
         project_id=PROJECT_ID, document_id=payload.get('document_id'), base_revision_id=payload.get('base_revision_id'),
+        target_url=payload.get('target_url'), baseline_sha256=payload.get('baseline_sha256'),
         code_bindings=bindings, request_sha256=hashlib.sha256(canonical(payload).encode()).hexdigest())
     proposal['id']='PR-'+uuid.uuid5(uuid.NAMESPACE_URL,'agent-submission:'+principal['subject_id']+':'+payload['request_id']).hex
     proposal['sha256'] = fingerprint(proposal)

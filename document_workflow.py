@@ -329,6 +329,11 @@ def publish(journal, service, proposal, identity, approval, proposal_receipt):
         raise WorkflowFailure('审核身份已失效或不匹配。')
     if approval.get('proposal_hash') != proposal['sha256'] or approval.get('reviewer') != identity['union_id']:
         raise WorkflowFailure('审核未绑定当前提案与登录身份。')
+    if proposal.get('target_url'):
+        from target_document import resolve
+        baseline = resolve(service, proposal['target_url'])
+        if baseline['content_sha256'] != proposal.get('baseline_sha256'):
+            raise WorkflowFailure('目标文档已变化，请重新准备提案并审核，不能沿用旧批准。')
     # Reverify archived snapshot before committing the approval.
     archived = archive(journal, service, proposal)
     if archived != proposal_receipt:
