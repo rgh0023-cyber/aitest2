@@ -1,18 +1,14 @@
 import json
 import time
 import uuid
-import hashlib
-from contextlib import closing
-import sqlite3
 import streamlit as st
 from project_access import authorize, request_access
 from login_ui import login
 from target_document import resolve
 from daily_backup import configured_service
-from document_workflow import Journal, WorkflowFailure, archive, FOLDERS
+from document_workflow import Journal, WorkflowFailure
 from submission_contract import validate, SubmissionFailure, PROJECT_ID
 from dingtalk_client import ConnectionFailure
-from proposal import canonical
 
 
 from submission_service import submit
@@ -28,8 +24,12 @@ def render(config):
         try:
             request_access(configured_service(config), identity)
             st.success('接入申请已记录；管理员批准一次后即可提交，无须领取密码。')
-        except (WorkflowFailure, ConnectionFailure):
-            st.error('接入申请未确认，请管理员核对记录。')
+        except WorkflowFailure as error:
+            st.error('接入申请未完成：'+str(error))
+        except ConnectionFailure as error:
+            st.error('接入申请未确认：'+error.stage+'；'+str(error.code)+'。请管理员核对记录后再试。')
+        except Exception:
+            st.error('接入申请未确认成功。请管理员核对服务配置与接入记录，不要反复提交。')
     st.caption('新参与者需一次项目接入批准。登录只识别提交人，不授予审核权限。')
     uploaded=st.file_uploader('可选：上传提案 JSON',type=['json'])
     imported={}

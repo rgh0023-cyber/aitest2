@@ -10,16 +10,21 @@ from dingtalk_client import request_json, ConnectionFailure
 
 
 def configured_service(config):
-    auth = request_json('https://api.dingtalk.com/v1.0/oauth2/accessToken', '定时备份应用认证',
+    # Same fixed pilot operator used by reviewer login and DocumentService.
+    # Older Streamlit Secrets omit this optional field.
+    user_id = config.get('user_id', '014542292620111416')
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise WorkflowFailure('服务操作人 user_id 配置无效，请管理员核对。')
+    auth = request_json('https://api.dingtalk.com/v1.0/oauth2/accessToken', '服务应用认证',
         {'appKey': config['client_id'], 'appSecret': config['client_secret']})
     token = auth.get('accessToken')
     if not token:
-        raise WorkflowFailure('备份无法获取应用凭据。')
+        raise WorkflowFailure('服务无法获取应用凭据。')
     user = request_json('https://oapi.dingtalk.com/topapi/v2/user/get?' + urlencode({'access_token': token}),
-        '定时备份操作人验证', {'userid': config['user_id']})
+        '服务操作人验证', {'userid': user_id})
     operator = user.get('result', {}).get('unionid')
     if not operator:
-        raise WorkflowFailure('备份操作人无法验证。')
+        raise WorkflowFailure('服务操作人无法验证。')
     return DocumentService(config, {'union_id': operator, 'expires_at': time.time() + 3600})
 
 

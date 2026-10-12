@@ -107,12 +107,17 @@ class WorkflowTests(unittest.TestCase):
         report = rebuilt.sync_and_restore(service)
         self.assertEqual(report['restored'], 1)
         entry = rebuilt.proposals()[0]
+        self.assertEqual(entry['title'], self.proposal['title'])
+        self.assertEqual(entry['module'], self.proposal['module'])
         self.assertEqual(rebuilt.load_proposal(service, entry), self.proposal)
         publish(self.journal, service, self.proposal, self.identity, self.approval, receipt)
         another = Journal(str(Path(self.temp.name) / 'another.sqlite3'))
         count = len(service.created)
         self.assertEqual(another.sync_and_restore(service)['restored'], 4)
         self.assertEqual(another.proposals()[0]['status'], '已发布')
+        with self.assertRaises(WorkflowFailure):
+            another.load_proposal(service, another.proposals()[0])
+        self.assertEqual(another.load_proposal(service, another.proposals()[0], readonly=True), self.proposal)
         publish(another, service, self.proposal, self.identity, self.approval, receipt)
         self.assertEqual(len(service.created), count)
 

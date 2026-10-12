@@ -170,6 +170,7 @@ class Journal:
         with closing(sqlite3.connect(path)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, digest TEXT, receipt TEXT, verified INTEGER DEFAULT 0)')
             db.execute('CREATE TABLE IF NOT EXISTS recovery_seals (id TEXT PRIMARY KEY)')
+            db.execute('CREATE TABLE IF NOT EXISTS proposal_catalog (id TEXT PRIMARY KEY, metadata TEXT)')
 
     def sync_and_restore(self, service):
         """Migrate trusted local receipts, then rebuild from signed remote evidence."""
@@ -216,6 +217,14 @@ class Journal:
                     if key in discovered and discovered[key] != candidate:
                         raise WorkflowFailure('同一操作存在冲突恢复凭据，恢复停止。')
                     discovered[key] = candidate
+                    if phase == 'proposal':
+                        marker = '\n\n机器快照（待审核）：\n'
+                        proposal = json.loads(text.rsplit(marker, 1)[1]) if marker in text else None
+                        check_proposal(proposal)
+                        if proposal['id'] != key.split(':')[0] or export_markdown(proposal) + marker + canonical(proposal) != text:
+                            raise ValueError('proposal snapshot')
+                        db.execute('INSERT OR REPLACE INTO proposal_catalog VALUES (?,?)',
+                                   (proposal['id'], canonical(proposal_metadata(proposal))))
                 except (KeyError, TypeError, ValueError, ConnectionFailure):
                     warnings.append('存在无效或不完整恢复凭据：' + node.get('nodeId', '未知'))
             # An orphan operation document blocks retries even without a signed manifest.
@@ -255,11 +264,13 @@ class Journal:
                     status = '审批执行中（需核对）'
                 if phases.get(proposal_id + ':change'):
                     status = '已发布'
-                result.append({'id': proposal_id, 'receipt': json.loads(raw), 'status': status})
+                metadata = db.execute('SELECT metadata FROM proposal_catalog WHERE id=?', (proposal_id,)).fetchone()
+                result.append({**(json.loads(metadata[0]) if metadata else {}),
+                               'id': proposal_id, 'receipt': json.loads(raw), 'status': status})
             return result
 
-    def load_proposal(self, service, entry):
-        if entry['status'] != '待审核':
+    def load_proposal(self, service, entry, readonly=False):
+        if entry['status'] != '待审核' and not readonly:
             raise WorkflowFailure('该提案已进入审批或发布，不可作为新的待审提案批准。')
         text = ''.join(service.read(entry['receipt']))
         marker = '\n\n机器快照（待审核）：\n'
@@ -280,6 +291,12 @@ class Journal:
         if not row or row[0] != hashlib.sha256(text.encode()).hexdigest():
             raise WorkflowFailure('远程提案内容与初次落库指纹不同，禁止加载审批。')
         return proposal
+
+    def cache_proposal(self, proposal):
+        check_proposal(proposal)
+        with self.lock, closing(sqlite3.connect(self.path)) as db, db:
+            db.execute('INSERT OR REPLACE INTO proposal_catalog VALUES (?,?)',
+                       (proposal['id'], canonical(proposal_metadata(proposal))))
 
     def document(self, service, key, title, folder, text):
         digest = hashlib.sha256(text.encode()).hexdigest()
@@ -317,10 +334,17 @@ def title(proposal, kind):
     return stamp + '｜' + kind + '｜' + proposal['id'] + '｜' + proposal['title'][:60]
 
 
+def proposal_metadata(proposal):
+    return {key: proposal.get(key, '') for key in
+            ('title', 'project', 'module', 'kind', 'created_at', 'submitted_by')}
+
+
 def archive(journal, service, proposal):
     check_proposal(proposal)
-    return journal.document(service, proposal['id'] + ':proposal', title(proposal, '待审核提案'),
+    receipt = journal.document(service, proposal['id'] + ':proposal', title(proposal, '待审核提案'),
         FOLDERS['proposal'], export_markdown(proposal) + '\n\n机器快照（待审核）：\n' + canonical(proposal))
+    journal.cache_proposal(proposal)
+    return receipt
 
 
 def publish(journal, service, proposal, identity, approval, proposal_receipt):
