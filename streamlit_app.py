@@ -8,13 +8,20 @@ from proposal import create_proposal, export_markdown, verify
 import json
 from login_flow import LoginRegistry, LoginFailure, authorization_url, verify_login, parse_callback
 from document_workflow import Journal, DocumentService, WorkflowFailure, archive, publish, now
+from backup_service import run_backup
+from agent_access import grant, revoke, credentials
 
 st.set_page_config(page_title="AI文档助手", page_icon="📄")
+if st.query_params.get('page') == 'submit':
+    from agent_page import render
+    render()
+    st.stop()  # Submission credentials can never reach owner/reviewer controls.
 st.title("AI文档助手")
 st.caption("第四阶段：单人审批发布试运行。提案、审核、发布与变更记录分别落库。")
+st.caption('level tunning：审核库保存过程，正式库保存批准版本，备份库保存最新完整副本与历史 diff。')
 
 @st.cache_resource
-def execution_journal(schema_version=3):
+def execution_journal(schema_version=5):
     # Version cache entries so hot deployments do not retain obsolete classes.
     return Journal()
 
@@ -149,6 +156,49 @@ else:
             st.caption('等待授权结果，5 分钟后过期。完成后回到本页面自动显示身份。')
     login_status()
 
+if st.session_state.get('reviewer_identity',{}).get('expires_at',0)>time.time():
+    with st.expander('管理其他 Agent 的提交权限'):
+        st.caption('每个凭据仅允许向 level tunning 提交待审材料。身份指凭据对应标识，不代替参与者本人的钉钉登录验证。凭据原文只显示给你，钉钉只存哈希与签名；妥善私下交给对应参与者。')
+        st.link_button('其他 Agent 的提交页面','https://aitest-kltimq4ak9guq9eijbhz3j.streamlit.app/?page=submit')
+        with st.form('issue_agent_credential'):
+            label=st.text_input('参与者或 Agent 标识',max_chars=80)
+            days=st.number_input('有效天数',min_value=1,max_value=30,value=7)
+            issue=st.form_submit_button('创建仅提交凭据')
+        if issue:
+            try:
+                access_service=DocumentService(config,st.session_state['reviewer_identity'])
+                token,payload,receipt=grant(access_service,label,int(days))
+                st.session_state['new_agent_grant']={'token':token,'label':payload['label'],'id':payload['credential_id']}
+                st.success('已创建并回读验证，仅具备提案提交权限。')
+            except (WorkflowFailure,ConnectionFailure):
+                st.error('创建未确认成功，请检查审核库接入记录，勿重复创建。')
+        new_grant=st.session_state.get('new_agent_grant')
+        if new_grant:
+            st.write('凭据对应：'+new_grant['label'])
+            st.code(new_grant['token'],language=None)
+            if st.button('我已保存，隐藏凭据'):
+                st.session_state.pop('new_agent_grant',None)
+                st.rerun()
+        if st.button('读取提交凭据列表'):
+            try:
+                st.session_state['agent_grants']=credentials(DocumentService(config,st.session_state['reviewer_identity']))
+            except (WorkflowFailure,ConnectionFailure):
+                st.error('无法核验接入记录。')
+        grants=st.session_state.get('agent_grants',[])
+        if grants:
+            active=[item for item in grants if not item['revoked'] and item['expires_at']>time.time()]
+            st.table([{'标识':item['label'],'权限':'仅提交','状态':'已撤销' if item['revoked'] else '有效' if item['expires_at']>time.time() else '已过期'} for item in grants])
+            if active:
+                chosen=st.selectbox('要撤销的提交凭据',[item['credential_id'] for item in active],
+                    format_func=lambda key:next(item['label'] for item in active if item['credential_id']==key))
+                if st.button('撤销所选提交凭据'):
+                    try:
+                        revoke(DocumentService(config,st.session_state['reviewer_identity']),chosen)
+                        st.session_state.pop('agent_grants',None)
+                        st.success('已撤销并回读验证；之后的提交会拒绝此凭据。')
+                    except (WorkflowFailure,ConnectionFailure):
+                        st.error('撤销未确认成功，请检查接入记录。')
+
 st.info('点击后使用企业应用凭据认证，以配置的操作人读取目标知识库；不会创建、修改或删除文档。')
 if st.button('测试钉钉连接', type='primary'):
     if time.time() - st.session_state.get('last_test', 0) < 10:
@@ -173,12 +223,12 @@ st.header('已保存提案')
 st.caption('登录后自动从钉钉扫描并校验恢复凭据，展示最近 100 条提案。恢复只重建列表与执行状态，不自动批准或发布。')
 list_identity = st.session_state.get('reviewer_identity')
 if list_identity and list_identity.get('expires_at', 0) > time.time():
-    if not st.session_state.get('cloud_recovery_v1'):
+    if not st.session_state.get('cloud_recovery_v3'):
         try:
             with st.spinner('从钉钉校验并恢复提案和执行状态…'):
                 recovery_service = DocumentService(config, list_identity)
                 report = execution_journal().sync_and_restore(recovery_service)
-            st.session_state['cloud_recovery_v1'] = report
+            st.session_state['cloud_recovery_v3'] = report
         except (WorkflowFailure, ConnectionFailure) as error:
             st.error(str(error) if isinstance(error, WorkflowFailure) else '恢复失败：' + error.stage + '；' + str(error.code))
             st.info('恢复未完整完成，暂不开放写入。请核对后重试。')
@@ -186,7 +236,7 @@ if list_identity and list_identity.get('expires_at', 0) > time.time():
         except Exception:
             st.error('恢复异常，写入暂时关闭。')
             st.stop()
-    report = st.session_state['cloud_recovery_v1']
+    report = st.session_state['cloud_recovery_v3']
     st.caption('已校验恢复 ' + str(report['restored']) + ' 个执行步骤。')
     if report['warnings']:
         with st.expander('恢复中需要核对的记录'):
@@ -215,13 +265,14 @@ if list_identity and list_identity.get('expires_at', 0) > time.time():
     else:
         st.info('当前服务暂无可定位的已保存提案。')
     if st.button('重新扫描钉钉并刷新列表'):
-        st.session_state.pop('cloud_recovery_v1', None)
+        st.session_state.pop('cloud_recovery_v3', None)
         st.rerun()
 else:
     st.info('完成钉钉登录后，可查看和加载已保存的提案。')
 
 st.divider()
 st.header('创建提案')
+st.info('提案与批准记录进入「AI文档协作与审核库」；仅正式文档新版本进入正式库。会议、问答及修正记录保存在审核库。')
 st.caption('将 Agent 生成的内容粘贴或上传到这里。每次生成独立快照，修改后需重新生成。当前快照仅在本次会话中保存，请及时下载；刷新、退出或服务重启可能丢失。')
 uploaded = st.file_uploader('导入 Agent 生成的 Markdown 正文（最多 1 MB）', type=['md', 'txt'])
 imported = ''
@@ -258,6 +309,10 @@ if snapshot and verify(snapshot):
     st.write('时间：' + snapshot['created_at'] + '（北京时间）')
     st.code(snapshot['sha256'], language=None)
     st.write('类型：' + snapshot['kind'] + '；范围：' + snapshot['action'])
+    if snapshot.get('submitted_by'):
+        st.write('提交身份（独立 Agent 凭据）：'+snapshot['submitted_by'])
+        st.write('请求 ID：'+snapshot.get('submission_request_id',''))
+        st.write('文档 ID：'+str(snapshot.get('document_id') or '待登记')+'；基线修订：'+str(snapshot.get('base_revision_id') or '待核验'))
     st.text(snapshot['title'])
     st.text(snapshot['reason'])
     # Render untrusted document text literally: no remote image requests or HTML.
@@ -309,6 +364,11 @@ if snapshot and verify(snapshot):
                         st.session_state['publication_receipts'] = publish(execution_journal(), service,
                             snapshot, active_identity, approval, receipt)
                     st.success('发布及独立变更记录已回读通过；项目索引仍待更新。')
+                    try:
+                        st.session_state['backup_result'] = run_backup(service)
+                        st.success('发布后备份验证完成。')
+                    except (WorkflowFailure, ConnectionFailure):
+                        st.warning('发布已完成，备份未完成。请在下方重新执行备份，不要重复批准发布。')
                 except (WorkflowFailure, ConnectionFailure) as error:
                     st.error(str(error) if isinstance(error, WorkflowFailure) else '发布中断：' + error.stage + '；' + str(error.code))
                     st.warning('可能已完成部分步骤。保留当前提案；同一提案再次执行会先核对已有回执，创建结果不确定时会停止。')
@@ -322,3 +382,25 @@ if snapshot and verify(snapshot):
         st.download_button('下载执行回执（请留存）', json.dumps(receipts, ensure_ascii=False, indent=2),
             file_name=snapshot['id'] + '-receipts.json', mime='application/json')
     st.caption('执行回执及签名恢复凭据已分别保存到钉钉；本地 SQLite 可从完整凭据重建。无签名、正文变化或不完整步骤将停止自动恢复执行，请人工核对。当前仍为单人试运行。')
+
+st.divider()
+st.header('level tunning 备份')
+st.caption('最新完整副本覆盖更新；历史 diff 长期保留。先保存并验证 diff，再覆盖副本。每日云端任务独立于本页面运行。')
+backup_identity = st.session_state.get('reviewer_identity')
+backup_allowed = bool(backup_identity and backup_identity.get('expires_at', 0) > time.time())
+if st.button('立即执行备份', disabled=not backup_allowed):
+    try:
+        with st.spinner('读取正式库、验证 diff 并更新备份…'):
+            st.session_state['backup_result'] = run_backup(DocumentService(config, backup_identity))
+    except (WorkflowFailure, ConnectionFailure) as error:
+        st.error(str(error) if isinstance(error, WorkflowFailure) else '备份失败：' + error.stage + '；' + str(error.code))
+    except Exception:
+        st.error('备份异常，请先核对已有备份。')
+backup_result = st.session_state.get('backup_result')
+if backup_result:
+    st.success(backup_result['status'])
+    st.link_button('查看最新完整备份', backup_result['latest']['url'])
+    if backup_result['diff']:
+        st.link_button('查看本次历史 diff', backup_result['diff']['url'])
+    st.download_button('下载备份回执', json.dumps(backup_result, ensure_ascii=False, indent=2),
+        file_name='level-tunning-backup-receipt.json', mime='application/json')

@@ -13,6 +13,10 @@ from dingtalk_client import request_json, ConnectionFailure
 from proposal import verify, export_markdown, canonical
 
 WORKSPACE = 'X1v4RSYLD9bwDk8P'
+REVIEW_WORKSPACE = 'p48ggSPMlmlwX587'
+REVIEW_FOLDER = 'YndMj49yWjPngNMKSb6QZjeeJ3pmz5aA'
+BACKUP_WORKSPACE = 'NK8M2SVq74poQJad'
+BACKUP_FOLDER = 'a9E05BDRVQ6d73nXuPg6b3A7J63zgkYA'
 FOLDERS = {
     'proposal': 'ydxXB52LJq7L2azjHZGdOYe3WqjMp697',
     'approval': 'ydxXB52LJq7L2azjHZGdOYe3WqjMp697',
@@ -22,6 +26,21 @@ FOLDERS = {
     '问答记录': 'Gl6Pm2Db8D30gXDBILxDpr3mJxLq0Ee4',
     'change': 'Gl6Pm2Db8D30gXDBILxDRNZnJxLq0Ee4',
 }
+LEGACY_FOLDERS = dict(FOLDERS)
+for review_kind in ('proposal', 'approval', '修正日志', '会议记录', '问答记录'):
+    FOLDERS[review_kind] = REVIEW_FOLDER
+# Formal publication/change logs remain in the formal library; recovery proofs do not.
+RECOVERY_FOLDER = REVIEW_FOLDER
+FOLDERS['backup'] = BACKUP_FOLDER
+FOLDERS['backup_manifest'] = BACKUP_FOLDER
+
+
+def folder_workspace(folder):
+    if folder == REVIEW_FOLDER:
+        return REVIEW_WORKSPACE
+    if folder == BACKUP_FOLDER:
+        return BACKUP_WORKSPACE
+    return WORKSPACE
 
 
 class WorkflowFailure(Exception):
@@ -65,7 +84,7 @@ class DocumentService:
             if not isinstance(page.get('nodes'), list):
                 raise WorkflowFailure('目录扫描结果异常，恢复停止。')
             for node in page['nodes']:
-                if node.get('workspaceId') != WORKSPACE:
+                if node.get('workspaceId') != folder_workspace(folder):
                     raise WorkflowFailure('扫描结果知识库归属异常。')
                 node = dict(node, recovery_folder=folder)
                 nodes.append(node)
@@ -88,19 +107,19 @@ class DocumentService:
         text = self.recovery_record(key, digest, receipt)
         # Duplicate identical manifests are harmless; conflicting signatures are rejected.
         title_text = now()[:19].replace('T', ' ').replace(':', '') + '｜服务恢复凭据｜' + key
-        remote = self.create(title_text, FOLDERS['change'])
+        remote = self.create(title_text, RECOVERY_FOLDER)
         self.ensure_content(remote, text)
 
     def validate_folder(self, folder):
         result = request_json('https://api.dingtalk.com/v2.0/wiki/nodes/' + quote(folder, safe='') +
             '?' + urlencode({'operatorId': self.operator}), '目标目录校验', headers=self.headers)
         node = result.get('node', {})
-        if node.get('workspaceId') != WORKSPACE or node.get('type') != 'FOLDER' or node.get('nodeId') != folder:
+        if node.get('workspaceId') != folder_workspace(folder) or node.get('type') != 'FOLDER' or node.get('nodeId') != folder:
             raise WorkflowFailure('目标目录类型或知识库归属不一致。')
 
     def create(self, title, folder):
         self.validate_folder(folder)
-        result = request_json('https://api.dingtalk.com/v1.0/doc/workspaces/' + WORKSPACE + '/docs',
+        result = request_json('https://api.dingtalk.com/v1.0/doc/workspaces/' + folder_workspace(folder) + '/docs',
             '创建独立记录', {'name': title, 'docType': 'DOC', 'operatorId': self.operator,
                           'parentNodeId': folder}, self.headers)
         if not all(isinstance(result.get(k), str) and result[k] for k in ('docKey', 'nodeId', 'url')):
@@ -167,7 +186,7 @@ class Journal:
                 db.commit()
 
             nodes = []
-            for folder in dict.fromkeys(FOLDERS.values()):
+            for folder in dict.fromkeys([*FOLDERS.values(), *LEGACY_FOLDERS.values()]):
                 nodes.extend(service.list_nodes(folder))
             discovered = {}
             by_url = {n.get('url', '').split('?')[0]: n for n in nodes}
@@ -181,14 +200,14 @@ class Journal:
                     if not isinstance(signature, str) or not hmac.compare_digest(signature, service.seal(payload)):
                         raise ValueError('signature')
                     key, digest, receipt = payload['operation'], payload['digest'], payload['receipt']
-                    if payload.get('version') != 1 or payload.get('workspace') != WORKSPACE or not re.fullmatch(r'PR-[a-f0-9]{32}:(proposal|approval|published|change)', key):
+                    if payload.get('version') != 1 or payload.get('workspace') != WORKSPACE or not re.fullmatch(r'PR-[a-f0-9]{32}:(proposal|approval|published|change|backup|backup_manifest)', key):
                         raise ValueError('schema')
                     target = by_url.get(receipt['url'].split('?')[0])
                     if not target:
                         warnings.append('恢复凭据对应文档已删除或移出管理目录：' + key)
                         continue
                     phase = key.split(':')[1]
-                    if phase in ('proposal', 'approval', 'change') and target['recovery_folder'] != FOLDERS[phase]:
+                    if phase in ('proposal', 'approval', 'change', 'backup', 'backup_manifest') and target['recovery_folder'] not in (FOLDERS[phase], LEGACY_FOLDERS.get(phase)):
                         raise ValueError('folder')
                     text = ''.join(service.read(receipt))
                     if hashlib.sha256(text.encode()).hexdigest() != digest:
@@ -200,7 +219,7 @@ class Journal:
                 except (KeyError, TypeError, ValueError, ConnectionFailure):
                     warnings.append('存在无效或不完整恢复凭据：' + node.get('nodeId', '未知'))
             # An orphan operation document blocks retries even without a signed manifest.
-            phases = {'待审核提案': 'proposal', '人工审核批准': 'approval', '版本变更': 'change',
+            phases = {'待审核提案': 'proposal', '人工审核批准': 'approval', '版本变更': 'change', '版本备份':'backup', '备份清单':'backup_manifest',
                       **{kind: 'published' for kind in ('正式文档新版本', '修正日志', '会议记录', '问答记录')}}
             for node in nodes:
                 match = re.search(r'｜([^｜]+)｜(PR-[a-f0-9]{32})｜', node.get('name', ''))
